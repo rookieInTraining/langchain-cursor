@@ -34,22 +34,25 @@ import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
 import { toJsonSchema } from "@langchain/core/utils/json_schema";
 import type { SerializableSchema } from "@langchain/core/utils/standard_schema";
 import type { ZodV3Like, ZodV4Like } from "@langchain/core/utils/types";
-import fs from "node:fs/promises";
-import os from "node:os";
-import { join } from "node:path";
 import {
   buildToolContract,
   CHAT_GUARDRAILS,
   type CursorToolCall,
   parseToolCalls,
+  partitionSystemMessages,
   serializeMessages,
 } from "./ChatCursorMessages.js";
+import {
+  type AgentRequest,
+  CursorRuntime,
+  type CursorSdkModule,
+} from "./CursorRuntime.js";
+
+export type { CursorSdkModule } from "./CursorRuntime.js";
 
 export interface ChatCursorCallOptions extends BaseChatModelCallOptions {
   tools?: ToolDefinition[];
 }
-
-export type CursorSdkModule = typeof import("@cursor/sdk");
 
 export interface ChatCursorFields extends BaseChatModelParams {
   model?: string;
@@ -61,6 +64,13 @@ export interface ChatCursorFields extends BaseChatModelParams {
    * unwrapped.
    */
   sdkLoader?: () => Promise<CursorSdkModule>;
+  /**
+   * How long, in milliseconds, an idle instance keeps the Cursor local
+   * executor warm so later calls skip its startup cost. Defaults to 60s; set
+   * `0` to tear it down after every call. The timer never holds the process
+   * open — call {@link ChatCursor.dispose} to release it immediately.
+   */
+  keepAliveMs?: number;
 }
 
 const DEFAULT_MODEL = "composer-2.5";
@@ -69,18 +79,24 @@ const DEFAULT_MODEL = "composer-2.5";
  * LangChain chat model backed by the Cursor Agents SDK local runtime.
  *
  * Cursor exposes no chat-completions API, so every `_generate` call runs a
- * fresh throwaway local agent: the message history is serialized into a
- * single prompt, the agent is sandboxed away from its own harness tools, and
- * tool calling is emulated through a prompt contract whose JSON reply is
- * parsed back into LangChain `tool_calls`.
+ * fresh throwaway local agent against an empty scratch workspace: the message
+ * history is serialized into a single prompt, system messages become the
+ * agent's own `systemPrompt`, and the agent is given no built-in tools so it
+ * can only answer with text. Tool calling is emulated on top of that through
+ * a prompt contract whose JSON reply is parsed back into LangChain
+ * `tool_calls`.
+ *
+ * Agents are throwaway, but the local executor behind them is not: it is kept
+ * warm between calls so only the first one pays its startup cost. See
+ * {@link ChatCursorFields.keepAliveMs} and {@link ChatCursor.dispose}.
  */
 export class ChatCursor extends BaseChatModel<ChatCursorCallOptions> {
   model: string;
   apiKey?: string | undefined;
 
-  #scratchDirs?: Promise<{ workspaceDir: string; storeDir: string }>;
+  #runtime: CursorRuntime;
   #sandbox = true;
-  #sdkLoader?: (() => Promise<CursorSdkModule>) | undefined;
+  #systemPrompt = true;
 
   static override lc_name(): string {
     return "ChatCursor";
@@ -90,7 +106,23 @@ export class ChatCursor extends BaseChatModel<ChatCursorCallOptions> {
     super(fields ?? {});
     this.model = fields?.model ?? DEFAULT_MODEL;
     this.apiKey = fields?.apiKey ?? process.env.CURSOR_API_KEY;
-    this.#sdkLoader = fields?.sdkLoader;
+    this.#runtime = new CursorRuntime({
+      sdkLoader: fields?.sdkLoader,
+      keepAliveMs: fields?.keepAliveMs,
+    });
+  }
+
+  /**
+   * Release the warm Cursor executor this instance is holding. Optional —
+   * an idle instance releases it on its own and never blocks process exit —
+   * but a long-lived host should call it when the model is no longer needed.
+   */
+  async dispose(): Promise<void> {
+    await this.#runtime.dispose();
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.dispose();
   }
 
   _llmType(): string {
@@ -189,35 +221,96 @@ export class ChatCursor extends BaseChatModel<ChatCursorCallOptions> {
     options: this["ParsedCallOptions"],
     _runManager?: CallbackManagerForLLMRun,
   ): Promise<ChatResult> {
-    try {
-      return await this.#generateOnce(messages, options);
-    } catch (error) {
-      // Cursor SDK sandboxing is unavailable in some environments (e.g. WSL)
-      // and the SDK hard-fails when it is requested there. The empty scratch
-      // workspace, disabled setting sources, and prompt guardrails still
-      // apply, so degrade gracefully and stop requesting the sandbox.
-      if (!this.#sandbox || !isSandboxUnsupportedError(error)) throw error;
+    // Both degradations below flip a sticky flag, so this retries at most
+    // once per flag and then gives up.
+    let speculative: unknown;
+    for (;;) {
+      try {
+        return await this.#generateOnce(messages, options);
+      } catch (error) {
+        const degraded = this.#degrade(error);
+        if (!degraded) throw speculative ?? error;
+        // The system-prompt gate is only recognizable by its message text, so
+        // a match may be a false positive. Keep the original error to report
+        // if the retry fails too — it is the more trustworthy one.
+        if (degraded === "system-prompt") speculative ??= error;
+      }
+    }
+  }
 
+  /**
+   * Turn off a capability the environment or account does not support and
+   * report whether the call is worth retrying.
+   */
+  #degrade(error: unknown): "sandbox" | "system-prompt" | undefined {
+    // Cursor SDK sandboxing is unavailable in some environments (e.g. WSL)
+    // and the SDK hard-fails when it is requested there. The empty scratch
+    // workspace, disabled setting sources, and the text-only toolset still
+    // apply, so degrade gracefully and stop requesting the sandbox.
+    if (this.#sandbox && isSandboxUnsupportedError(error)) {
       console.warn(
         "[langchain-cursor] Cursor SDK sandboxing is not supported in this environment, retrying without it.",
       );
       this.#sandbox = false;
-      return await this.#generateOnce(messages, options);
+      return "sandbox";
     }
+
+    // `systemPrompt` is gated server-side and rejected on the first send
+    // rather than at create, so fall back to inlining system messages in the
+    // prompt the way this package did before the option existed.
+    if (this.#systemPrompt && isSystemPromptUnsupportedError(error)) {
+      console.warn(
+        "[langchain-cursor] Cursor rejected a custom system prompt for this account, falling back to inline system messages.",
+      );
+      this.#systemPrompt = false;
+      return "system-prompt";
+    }
+
+    return undefined;
   }
 
   async #generateOnce(
     messages: BaseMessage[],
     options: this["ParsedCallOptions"],
   ): Promise<ChatResult> {
-    const prompt = serializeMessages(messages);
+    // An SDK old enough to lack the platform API also ignores `tools` and
+    // `systemPrompt`, so fall back to stating both in the prompt.
+    const native = await this.#runtime.supportsNativeOptions();
     const tools = options.tools ?? [];
 
-    const sections = [prompt.text, CHAT_GUARDRAILS];
+    let systemPrompt: string | undefined;
+    let history = messages;
+    if (native && this.#systemPrompt) {
+      const partitioned = partitionSystemMessages(messages);
+      if (partitioned.systemText) {
+        systemPrompt = partitioned.systemText;
+        history = partitioned.rest;
+      }
+    }
+
+    const prompt = serializeMessages(history);
+    const sections = [prompt.text];
+    if (!native) sections.push(CHAT_GUARDRAILS);
     if (tools.length) sections.push(buildToolContract(tools));
     const text = sections.join("\n\n");
 
-    const agent = await this.#createAgent();
+    const request: AgentRequest = {
+      ...(this.apiKey ? { apiKey: this.apiKey } : {}),
+      model: { id: this.model },
+      sandbox: this.#sandbox,
+      // No built-in tools: the agent is used as a chat model, and a
+      // text-only reply is exactly what the tool contract asks it to produce.
+      ...(native ? { tools: [] } : {}),
+      ...(systemPrompt ? { systemPrompt } : {}),
+    };
+
+    // Build the executor and resolve the agent at the same time. They hit
+    // different things — a workspace/auth bootstrap versus the model catalog
+    // — so overlapping them takes roughly a third off a cold start. If the
+    // sandbox then turns out to be unsupported, this warmed the wrong key and
+    // the retry rebuilds; that costs one executor build, once per instance.
+    const warming = this.#runtime.ensureWarm(request).catch(() => {});
+    const agent = await this.#runtime.createAgent(request);
     try {
       const first = await this.#send(
         agent,
@@ -258,40 +351,13 @@ export class ChatCursor extends BaseChatModel<ChatCursorCallOptions> {
 
       return { generations: [{ text: content, message }] };
     } finally {
+      // Settle the lease before dropping this agent's reference: if the
+      // prewarm were still in flight the count could reach zero here and the
+      // SDK would tear down the executor we are paying to keep.
+      await warming;
       agent.close();
+      this.#runtime.touch();
     }
-  }
-
-  async #createAgent(): Promise<SDKAgent> {
-    const { Agent, JsonlLocalAgentStore } = await this.#importCursorSdk();
-    const { workspaceDir, storeDir } = await this.#ensureScratchDirs();
-
-    // The empty workspace, disabled setting sources, and sandbox (where the
-    // environment supports it) all keep the throwaway agent from touching the
-    // user's files or MCP servers; the store keeps its run records out of the
-    // user's Cursor state root.
-    return Agent.create({
-      ...(this.apiKey ? { apiKey: this.apiKey } : {}),
-      model: { id: this.model },
-      local: {
-        cwd: workspaceDir,
-        settingSources: [],
-        sandboxOptions: { enabled: this.#sandbox },
-        store: new JsonlLocalAgentStore(storeDir),
-      },
-    });
-  }
-
-  #ensureScratchDirs() {
-    this.#scratchDirs ??= (async () => {
-      const root = await fs.mkdtemp(join(os.tmpdir(), "langchain-cursor-"));
-      const workspaceDir = join(root, "workspace");
-      const storeDir = join(root, "store");
-      await fs.mkdir(workspaceDir, { recursive: true });
-      await fs.mkdir(storeDir, { recursive: true });
-      return { workspaceDir, storeDir };
-    })();
-    return this.#scratchDirs;
   }
 
   async #send(
@@ -342,23 +408,6 @@ export class ChatCursor extends BaseChatModel<ChatCursorCallOptions> {
     }
   }
 
-  async #importCursorSdk(): Promise<CursorSdkModule> {
-    if (this.#sdkLoader) return this.#sdkLoader();
-
-    try {
-      return await import("@cursor/sdk");
-    } catch (error) {
-      // @cursor/sdk ships a webpack-chunked dist that loads chunks dynamically
-      // (`require("./" + chunkId + ".js")`), so it cannot be inlined by
-      // bundlers and must be resolvable from node_modules at runtime.
-      throw new Error(
-        "Failed to load @cursor/sdk — langchain-cursor requires a runtime " +
-          "that resolves node_modules; single-file compiled binaries are not " +
-          "supported.",
-        { cause: error },
-      );
-    }
-  }
 }
 
 function correctivePrompt(error: unknown): string {
@@ -417,6 +466,23 @@ function isSandboxUnsupportedError(error: unknown): boolean {
     error instanceof Error &&
     error.name === "ConfigurationError" &&
     /sandbox/i.test(error.message)
+  );
+}
+
+/**
+ * The `systemPrompt` gate has no dedicated error class or code — the backend
+ * rejects the run with an invalid-argument error whose message names the
+ * `--system-prompt` flag. Match that, plus the looser wording, and rely on
+ * the caller to treat a match as speculative.
+ */
+function isSystemPromptUnsupportedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (/--system-prompt/.test(error.message)) return true;
+  return (
+    /system[_ -]?prompt/i.test(error.message) &&
+    /invalid|not (enabled|supported|allowed)|permission|access/i.test(
+      error.message,
+    )
   );
 }
 

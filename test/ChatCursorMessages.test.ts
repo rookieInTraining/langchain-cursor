@@ -3,6 +3,7 @@ import {
   AIMessage,
   HumanMessage,
   SystemMessage,
+  ToolMessage,
 } from "@langchain/core/messages";
 import { describe, expect, it } from "vitest";
 import {
@@ -10,6 +11,7 @@ import {
   CHAT_GUARDRAILS,
   extractJsonObject,
   parseToolCalls,
+  partitionSystemMessages,
   serializeMessages,
 } from "../src/ChatCursorMessages.js";
 
@@ -175,5 +177,77 @@ describe("parseToolCalls", () => {
 
   it("throws on JSON with the wrong shape", () => {
     expect(() => parseToolCalls('{"actions": ["click"]}')).toThrow();
+  });
+});
+
+describe("partitionSystemMessages", () => {
+  it("lifts system messages out of the history", () => {
+    const { systemText, rest } = partitionSystemMessages([
+      new SystemMessage("Be terse."),
+      new HumanMessage("Hi"),
+    ]);
+
+    expect(systemText).toBe("Be terse.");
+    expect(rest).toHaveLength(1);
+    expect(rest[0]?.getType()).toBe("human");
+  });
+
+  it("joins several system messages in order", () => {
+    const { systemText } = partitionSystemMessages([
+      new SystemMessage("Be terse."),
+      new HumanMessage("Hi"),
+      new SystemMessage("Answer in French."),
+    ]);
+
+    expect(systemText).toBe("Be terse.\n\nAnswer in French.");
+  });
+
+  it("leaves the history untouched when there is nothing to lift", () => {
+    const messages = [new HumanMessage("Hi"), new AIMessage("Hello")];
+    const { systemText, rest } = partitionSystemMessages(messages);
+
+    expect(systemText).toBe("");
+    expect(rest).toBe(messages);
+  });
+
+  it("does not lift whitespace-only system messages", () => {
+    // The SDK rejects an empty `systemPrompt`, so these have to stay inline.
+    const messages = [new SystemMessage("   "), new HumanMessage("Hi")];
+    const { systemText, rest } = partitionSystemMessages(messages);
+
+    expect(systemText).toBe("");
+    expect(rest).toBe(messages);
+  });
+
+  it("does not lift system messages carrying images", () => {
+    // The attachment rides with the user payload, so splitting the text away
+    // from its `[image N attached]` placeholder would scramble the numbering.
+    const messages = [
+      new SystemMessage({
+        content: [
+          { type: "text", text: "Match this style" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,aGVsbG8=" },
+          },
+        ],
+      }),
+      new HumanMessage("Hi"),
+    ];
+    const { systemText, rest } = partitionSystemMessages(messages);
+
+    expect(systemText).toBe("");
+    expect(rest).toBe(messages);
+  });
+});
+
+describe("serializeMessages role tags", () => {
+  it("tags tool results so the model can tell them from user turns", () => {
+    const { text } = serializeMessages([
+      new HumanMessage("Click it"),
+      new ToolMessage({ content: "clicked", tool_call_id: "call_1" }),
+    ]);
+
+    expect(text).toContain("<tool_result>\nclicked\n</tool_result>");
   });
 });

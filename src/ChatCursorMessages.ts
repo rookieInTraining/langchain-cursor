@@ -186,3 +186,42 @@ export function parseToolCalls(text: string): CursorToolCall[] {
     args: call.arguments ?? call.args ?? {},
   }));
 }
+
+/**
+ * Split leading-role system messages out of the history so they can be passed
+ * as the agent's own system prompt instead of being inlined as `<system>`
+ * blocks in the user turn.
+ *
+ * Returns an empty `systemText` — leaving `rest` untouched — whenever the
+ * messages cannot be lifted safely: when there are no system messages, when
+ * they are whitespace-only (the SDK rejects an empty `systemPrompt`), or when
+ * any of them carries an image. Images ride with the user payload, so lifting
+ * the text away from its `[image N attached]` placeholder would scramble the
+ * numbering; in that case every system message stays inline.
+ */
+export function partitionSystemMessages(messages: BaseMessage[]): {
+  systemText: string;
+  rest: BaseMessage[];
+} {
+  const inline = { systemText: "", rest: messages };
+
+  const system = messages.filter((message) => message.getType() === "system");
+  if (!system.length) return inline;
+
+  const images: CursorImage[] = [];
+  const texts = system.map((message) =>
+    serializeContent(message.content, images),
+  );
+  if (images.length) return inline;
+
+  const systemText = texts
+    .map((text) => text.trim())
+    .filter((text) => text)
+    .join("\n\n");
+  if (!systemText) return inline;
+
+  return {
+    systemText,
+    rest: messages.filter((message) => message.getType() !== "system"),
+  };
+}
