@@ -5,7 +5,7 @@ LangChain chat model that runs prompts through [Cursor Agents](https://cursor.co
 ## Installation
 
 ```bash
-npm install @alumnium/langchain-cursor @langchain/core
+npm install langchain-cursor @langchain/core
 ```
 
 Generate an API key in the [Cursor Dashboard](https://cursor.com/dashboard) and expose it as `CURSOR_API_KEY` (or pass it via the constructor).
@@ -15,7 +15,7 @@ Generate an API key in the [Cursor Dashboard](https://cursor.com/dashboard) and 
 ### Basic
 
 ```typescript
-import { ChatCursor } from "@alumnium/langchain-cursor";
+import { ChatCursor } from "langchain-cursor";
 
 const llm = new ChatCursor(); // defaults to composer-2.5, reads CURSOR_API_KEY
 const response = await llm.invoke("Hello!");

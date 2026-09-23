@@ -4,7 +4,7 @@
   "description": "LangChain chat model for Cursor models via the Cursor Agents SDK (local runtime)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/alumnium-hq/langchain-cursor.git"
+    "url": "git+https://github.com/rookieInTraining/langchain-cursor.git"
   },
   "keywords": [
     "langchain",
@@ -33,9 +33,6 @@
   "files": [
     "dist"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "engines": {
     "node": ">=20"
   },
